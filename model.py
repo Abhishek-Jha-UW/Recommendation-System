@@ -18,6 +18,18 @@ def dataset_summary(df: pd.DataFrame) -> dict:
     }
 
 
+def rating_column_stats(df: pd.DataFrame) -> dict[str, float]:
+    """Stats on the rating column (named `rating` after validation)."""
+    col = df["rating"] if "rating" in df.columns else df.iloc[:, 2]
+    s = col.astype(float)
+    return {
+        "min": float(s.min()),
+        "max": float(s.max()),
+        "mean": float(s.mean()),
+        "std": float(s.std(ddof=0)) if len(s) > 1 else 0.0,
+    }
+
+
 class RecommenderEngine:
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy()
@@ -89,7 +101,8 @@ class RecommenderEngine:
     def get_item_cooccurrence(self, target_user, n=5) -> pd.Series:
         """
         Binary co-occurrence: sum over the user's rated items of how often other items
-        appear together with those items in any user's profile (not Apriori / lift).
+        co-occur in user profiles. Ranking uses counts; see association_metrics_breakdown
+        for support / confidence / lift on item pairs.
         """
         if target_user not in self.pivot.index:
             return pd.Series(dtype=float)
@@ -120,6 +133,89 @@ class RecommenderEngine:
             return pd.DataFrame(columns=["rated_item", "cooccurrence_count"])
         counts = co_matrix.loc[recommended_item, rated].sort_values(ascending=False).head(top_k)
         return pd.DataFrame({"rated_item": counts.index, "cooccurrence_count": counts.values})
+
+    def association_metrics_breakdown(
+        self, target_user, consequent_item: str, top_k: int = 8
+    ) -> pd.DataFrame:
+        """
+        Market-basket-style metrics on binary interactions: treat each rated item as
+        antecedent A and the recommended item as consequent C.
+
+        - support(A∩C) = users who rated both / n_users
+        - confidence(A→C) = cooccurrence / users who rated A
+        - lift(A→C) = confidence / P(C), where P(C) = users who rated C / n_users
+        """
+        if target_user not in self.pivot.index or consequent_item not in self.pivot.columns:
+            return pd.DataFrame(
+                columns=[
+                    "antecedent_item",
+                    "cooccurrence",
+                    "support",
+                    "confidence_if_antecedent",
+                    "lift",
+                ]
+            )
+        basket = self.pivot.notna().astype(int)
+        n_users = int(basket.shape[0])
+        if n_users == 0:
+            return pd.DataFrame(
+                columns=[
+                    "antecedent_item",
+                    "cooccurrence",
+                    "support",
+                    "confidence_if_antecedent",
+                    "lift",
+                ]
+            )
+
+        user_items = basket.loc[target_user]
+        rated = user_items[user_items == 1].index
+        rated = rated[rated != consequent_item]
+        if len(rated) == 0:
+            return pd.DataFrame(
+                columns=[
+                    "antecedent_item",
+                    "cooccurrence",
+                    "support",
+                    "confidence_if_antecedent",
+                    "lift",
+                ]
+            )
+
+        co_matrix = basket.T.dot(basket)
+        if consequent_item not in co_matrix.index:
+            return pd.DataFrame(
+                columns=[
+                    "antecedent_item",
+                    "cooccurrence",
+                    "support",
+                    "confidence_if_antecedent",
+                    "lift",
+                ]
+            )
+
+        cnt_c = int(basket[consequent_item].sum())
+        prob_c = cnt_c / n_users if n_users else 0.0
+
+        rows: list[dict] = []
+        for ant in rated:
+            co = int(co_matrix.loc[consequent_item, ant])
+            cnt_a = int(basket[ant].sum())
+            support = co / n_users if n_users else 0.0
+            conf = co / cnt_a if cnt_a else 0.0
+            lift = conf / prob_c if prob_c > 0 else 0.0
+            rows.append(
+                {
+                    "antecedent_item": ant,
+                    "cooccurrence": co,
+                    "support": support,
+                    "confidence_if_antecedent": conf,
+                    "lift": lift,
+                }
+            )
+
+        out = pd.DataFrame(rows).sort_values("lift", ascending=False).head(top_k)
+        return out.reset_index(drop=True)
 
     @staticmethod
     def evaluate_user_based_holdout(

@@ -11,9 +11,10 @@ A frozen copy of the original app lives in [`initial_data/`](initial_data/) for 
 - **Tabs:** Overview, Data (summary + table), Methods (reference table), Playground, Evaluation.
 - **Strategies:** user-based CF, item-based CF, item co-occurrence (honest naming).
 - **Explainability:** similar users (user-based), contribution breakdown (item-based), co-occurrence breakdown (co-occurrence).
-- **CSV upload** with validation; built-in sample; template download.
+- **Data tab:** observed rating min/max/mean/std; optional **expected range** validation (warnings only).
+- **Item co-occurrence:** summed counts for ranking; **support / confidence / lift** for antecedent → top pick in Playground.
 - **Hold-out RMSE / MAE** for user-based CF (rough sanity check).
-- **Optional OpenAI:** grounded “Explain this run” after you generate recommendations (`OPENAI_API_KEY` in Streamlit secrets).
+- **Optional OpenAI:** grounded explanations in **Playground** (recommendations) and **Evaluation** (hold-out metrics).
 
 ---
 

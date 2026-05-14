@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from data import build_sample_dataframe
-from model import RecommenderEngine, dataset_summary
+from model import RecommenderEngine, dataset_summary, rating_column_stats
 
 try:
     from ai_explain import explain_run_json
@@ -50,6 +50,8 @@ def cached_uploaded_csv(file_bytes: bytes) -> pd.DataFrame:
 def init_session() -> None:
     if "last_evidence" not in st.session_state:
         st.session_state.last_evidence = None
+    if "last_eval_evidence" not in st.session_state:
+        st.session_state.last_eval_evidence = None
 
 
 def get_openai_credentials() -> tuple[str | None, str]:
@@ -140,7 +142,7 @@ with st.sidebar:
         help=(
             "User-based: neighbors with similar rating vectors. "
             "Item-based: items similar to those you rated. "
-            "Co-occurrence: how often items appear together across users (not Apriori lift)."
+            "Co-occurrence: counts plus support / confidence / lift for item pairs (Playground)."
         ),
     )
     st.divider()
@@ -199,18 +201,13 @@ with tab_overview:
         """
 - **User-based CF** — find users with similar rating patterns; blend their ratings for unseen items.
 - **Item-based CF** — find items similar to those you rated highly; rank unseen items by weighted similarity.
-- **Item co-occurrence** — binary “also interacted” counts across users (not full market-basket metrics such as lift).
+- **Item co-occurrence** — binary “also interacted” counts to rank candidates; in **Playground**, the top pick also shows **support, confidence, and lift** for pairs with your rated items (association-rule style metrics on the same binary matrix).
 
 **Limitations:** cold start for new users/items, sparsity, popularity bias, and no temporal split (ratings treated as static).
+
+Optional **AI explanations** (if secrets are set) appear in **Playground** and **Evaluation** after you run the corresponding action — see the sidebar for connection status.
         """
     )
-    if openai_key and _HAS_AI_MODULE:
-        st.success("OpenAI secret detected: you can use **Explain this run (AI)** in Playground after a run.")
-    else:
-        st.caption(
-            "Optional: add `OPENAI_API_KEY` (and optionally `OPENAI_MODEL`) in Streamlit secrets "
-            "for short, grounded interpretations."
-        )
 
 with tab_data:
     st.subheader("Dataset summary")
@@ -219,6 +216,52 @@ with tab_data:
     c2.metric("Users", summary["n_users"])
     c3.metric("Items", summary["n_items"])
     c4.metric("Sparsity", f"{summary['sparsity']:.1%}")
+
+    rstats = rating_column_stats(df_valid)
+    st.subheader("Rating column (observed)")
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("Min", f"{rstats['min']:.4g}")
+    r2.metric("Max", f"{rstats['max']:.4g}")
+    r3.metric("Mean", f"{rstats['mean']:.4g}")
+    r4.metric("Std", f"{rstats['std']:.4g}")
+    st.caption(
+        "Algorithms do not assume a 1–5 scale; any numeric ratings work. "
+        "RMSE/MAE in Evaluation are on the same scale as these values."
+    )
+
+    with st.expander("Optional: validate against an expected range", expanded=False):
+        st.markdown(
+            "Use this if you know the survey or system scale (e.g. 1–5 stars, 0–100). "
+            "The app only **warns**; it does not change your data."
+        )
+        check_rng = st.checkbox("Flag ratings outside expected min/max", value=False, key="chk_rating_range")
+        if check_rng:
+            ec1, ec2 = st.columns(2)
+            exp_lo = ec1.number_input(
+                "Expected minimum",
+                value=float(rstats["min"]),
+                format="%.6g",
+                key="exp_rating_min",
+            )
+            exp_hi = ec2.number_input(
+                "Expected maximum",
+                value=float(rstats["max"]),
+                format="%.6g",
+                key="exp_rating_max",
+            )
+            if exp_lo > exp_hi:
+                st.error("Expected minimum cannot be greater than expected maximum.")
+            else:
+                bad = df_valid["rating"][(df_valid["rating"] < exp_lo) | (df_valid["rating"] > exp_hi)]
+                n_bad = int(bad.shape[0])
+                if n_bad:
+                    st.warning(
+                        f"{n_bad} rating(s) fall outside [{exp_lo}, {exp_hi}]. "
+                        "Inspect uploads for typos or mixed scales."
+                    )
+                else:
+                    st.success(f"All ratings lie within [{exp_lo}, {exp_hi}].")
+
     st.dataframe(df_valid, use_container_width=True, height=320)
 
 with tab_methods:
@@ -229,7 +272,7 @@ with tab_methods:
 |----------|------|-------------------|
 | **User-based CF** | Cosine similarity between **user** vectors (missing → 0). Top 10 neighbors; weighted sum of neighbor rating vectors. | Not calibrated to 1–5; use for **ranking**. |
 | **Item-based CF** | Cosine similarity between **item** vectors; multiply by your ratings on rated items. | Same: relative strength. |
-| **Item co-occurrence** | Binary matrix; **item × item** co-occurrence counts summed over your rated items. | Count-like; higher = more overlap across users. |
+| **Item co-occurrence** | Binary matrix; rank by summed co-occurrence. **Playground** adds **support, confidence, lift** for antecedent → top recommended item. | Count rank + rule-style diagnostics. |
 
 **Libraries:** `pandas`, `numpy`, `sklearn.metrics.pairwise.cosine_similarity`.
         """
@@ -303,6 +346,22 @@ with tab_play:
                     st.dataframe(cb, use_container_width=True)
                     evidence["cooccurrence_top_pick"] = cb.to_dict(orient="records")
 
+                    st.subheader("Association metrics (antecedent → top pick)")
+                    st.caption(
+                        "From the same binary matrix: **support** = P(A∩C), "
+                        "**confidence** = P(C|A), **lift** = confidence / P(C)."
+                    )
+                    am = engine.association_metrics_breakdown(selected_user, top_item, top_k=8)
+                    if not am.empty:
+                        disp = am.copy()
+                        disp["support"] = disp["support"].round(4)
+                        disp["confidence_if_antecedent"] = disp["confidence_if_antecedent"].round(4)
+                        disp["lift"] = disp["lift"].round(4)
+                        st.dataframe(disp, use_container_width=True)
+                        evidence["association_metrics_top_pick"] = am.to_dict(orient="records")
+                    else:
+                        st.caption("Not enough rated items to form association rows for this pick.")
+
                 st.session_state.last_evidence = evidence
                 st.balloons()
             else:
@@ -315,7 +374,12 @@ with tab_play:
         st.caption("One API call per click. Uses only the structured evidence from your last successful run.")
         if st.button("Explain this run (AI)"):
             try:
-                txt = explain_run_json(st.session_state.last_evidence, api_key=openai_key, model=openai_model)
+                txt = explain_run_json(
+                    st.session_state.last_evidence,
+                    api_key=openai_key,
+                    model=openai_model,
+                    topic="recommendations",
+                )
                 st.markdown(txt)
             except Exception as e:
                 st.error(f"OpenAI call failed: {e}")
@@ -338,12 +402,50 @@ with tab_eval:
             )
         if err:
             st.warning(err)
+            st.session_state.last_eval_evidence = None
         else:
             e1, e2, e3 = st.columns(3)
             e1.metric("RMSE", f"{rmse:.3f}")
             e2.metric("MAE", f"{mae:.3f}")
             e3.metric("Hold-out predictions", n_pred)
             st.caption("Lower is better. Interpret with care on tiny samples.")
+
+            rs = rating_column_stats(df_valid)
+            st.session_state.last_eval_evidence = {
+                "topic": "evaluation",
+                "method": "User-based collaborative filtering, random hold-out rows",
+                "rmse": rmse,
+                "mae": mae,
+                "n_holdout_predictions": n_pred,
+                "observed_rating_min": rs["min"],
+                "observed_rating_max": rs["max"],
+                "observed_rating_mean": rs["mean"],
+                "caveats": [
+                    "Not a temporal split; ratings treated as exchangeable.",
+                    "User-based scores are not calibrated to the rating scale; errors are in raw rating units.",
+                    "Small samples make RMSE/MAE noisy.",
+                ],
+            }
+
+    if st.session_state.last_eval_evidence and openai_key and _HAS_AI_MODULE:
+        st.divider()
+        st.subheader("Optional: AI interpretation of metrics")
+        st.caption("One API call per click. Uses only the numbers and notes from your last evaluation run.")
+        if st.button("Explain this evaluation (AI)", key="eval_ai_btn"):
+            try:
+                txt = explain_run_json(
+                    st.session_state.last_eval_evidence,
+                    api_key=openai_key,
+                    model=openai_model,
+                    topic="evaluation",
+                )
+                st.markdown(txt)
+            except Exception as e:
+                st.error(f"OpenAI call failed: {e}")
+    elif st.session_state.last_eval_evidence and not openai_key:
+        st.caption("Add `OPENAI_API_KEY` in Streamlit secrets to enable evaluation explanations.")
+    elif openai_key and _HAS_AI_MODULE and not st.session_state.last_eval_evidence:
+        st.info("Run **hold-out RMSE / MAE** first; then you can use **Explain this evaluation (AI)**.")
 
 st.divider()
 st.caption("Portfolio demo — collaborative filtering and co-occurrence | Abhishek Jha")
